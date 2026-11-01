@@ -1,130 +1,126 @@
 import asyncio
-from urllib.parse import urljoin
+from extrator_adem import extrair_ofertas
+from tradutor_texto import traduzir
+from gerenciador_arquivo import salvar_ofertas
+import auditor
 
-import aiofiles
-from deep_translator import GoogleTranslator
-from playwright.async_api import (
-    Error as PlaywrightError,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
-
-BASE_URL = "https://adem.public.lu/en/jobboard.html#q=data+analyst&mode=any"
-OUTPUT_FILE = "ofertas_Luxemburgo.txt"
-DEBUG_HTML = "debug_page.html"
-
-LINK_SELECTORS = [
-    "a[href*='/job-offer/']",
-    "a[href*='/offre-emploi/']",
-    "a[href*='job']",
-    ".job-offer-link",
-    "article a",  # Seletor genérico para artigos com links
-]
+MAX_TENTATIVAS_RETRY = 3
+ESPERA_ENTRE_RETRIES = (30, 60, 120)
+PAUSA_ENTRE_TRADUCOES = 1
 
 
-async def coletar_links(page) -> list[str]:
-    print("\n--- INICIANDO COLETA DE LINKS ---")
-    for seletor in LINK_SELECTORS:
-        print(f"Tentando seletor: {seletor} ...")
-        try:
-            await page.wait_for_selector(seletor, timeout=5000)
-            elementos = await page.query_selector_all(seletor)
-            print(f"  -> Encontrados {len(elementos)} elementos com este seletor.")
-            if elementos:
-                urls = []
-                for el in elementos:
-                    href = await el.get_attribute("href")
-                    if href:
-                        urls.append(urljoin("https://adem.public.lu", href))
-                unique_urls = list(dict.fromkeys(urls))
-                print(f"  -> Total de {len(unique_urls)} URLs únicas coletadas.")
-                return unique_urls
-        except PlaywrightTimeoutError:
-            print(f"  -> Seletor '{seletor}' não encontrado (timeout).")
-            continue
-    print("--- NENHUM LINK ENCONTRADO COM OS SELETORES ATUAIS ---")
-    return []
+async def _traduzir_com_buffer(ofertas: list[dict]) -> list[dict]:
+    lista_final: list[dict] = []
+    buffer_retry: list[dict] = []
+    descartadas_por_tamanho = 0
+
+    auditor.info("main", f"Tradução primária de {len(ofertas)} ofertas...")
+    for i, oferta in enumerate(ofertas, start=1):
+        auditor.info("main", f"  Traduzindo [{i}/{len(ofertas)}]")
+        # CORREÇÃO: traduzir() agora é async, precisa de await
+        sucesso, texto, retentavel = await traduzir(oferta["texto"])
+        oferta["traduzido"] = sucesso
+        oferta["texto_traduzido"] = texto if sucesso else ""
+
+        if sucesso:
+            lista_final.append(oferta)
+        elif retentavel:
+            buffer_retry.append(oferta)
+        else:
+            # Falha caracterizada (ex: estouro de caracteres) → não retenta
+            lista_final.append(oferta)
+            descartadas_por_tamanho += 1
+
+        await asyncio.sleep(PAUSA_ENTRE_TRADUCOES)
+
+    auditor.info(
+        "main",
+        f"Primária: {len(lista_final)} ok, {len(buffer_retry)} no buffer, "
+        f"{descartadas_por_tamanho} descartada(s) por tamanho.",
+    )
+
+    for tentativa, espera in enumerate(ESPERA_ENTRE_RETRIES, start=1):
+        if not buffer_retry:
+            break
+        auditor.warning(
+            "main",
+            f"Retry {tentativa}/{MAX_TENTATIVAS_RETRY}: {len(buffer_retry)} pendente(s). "
+            f"Aguardando {espera}s...",
+        )
+        await asyncio.sleep(espera)
+
+        novos_falhos: list[dict] = []
+        for oferta in buffer_retry:
+            # CORREÇÃO: traduzir() agora é async, precisa de await
+            sucesso, texto, retentavel = await traduzir(oferta["texto"])
+            if sucesso:
+                oferta["traduzido"] = True
+                oferta["texto_traduzido"] = texto
+                lista_final.append(oferta)
+            elif retentavel:
+                novos_falhos.append(oferta)
+            else:
+                # Falha caracterizada durante retry → descarta do buffer
+                lista_final.append(oferta)
+                descartadas_por_tamanho += 1
+        buffer_retry = novos_falhos
+
+    for oferta in buffer_retry:
+        oferta["traduzido"] = False
+        oferta["texto_traduzido"] = ""
+        lista_final.append(oferta)
+
+    if buffer_retry:
+        auditor.error(
+            "main",
+            f"{len(buffer_retry)} oferta(s) não traduzida(s) após {MAX_TENTATIVAS_RETRY} tentativas.",
+        )
+    if descartadas_por_tamanho:
+        auditor.estouro_caracteres(
+            "main",
+            f"{descartadas_por_tamanho} oferta(s) descartada(s) da tradução por excesso de tamanho.",
+        )
+
+    return lista_final
 
 
-async def main():
-    print("Iniciando script...")
-    async with async_playwright() as p:
-        print("Abrindo navegador Chromium...")
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
+async def main() -> None:
+    auditor.info("main", "=" * 60)
+    auditor.info("main", "INICIANDO PIPELINE")
+    auditor.info("main", "=" * 60)
 
-        print(f"Acessando a página de busca: {BASE_URL}")
-        try:
-            await page.goto(BASE_URL, timeout=60000)
-            print("Página carregada. Aguardando rede ficar ociosa...")
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            print("Rede ociosa.")
-        except PlaywrightTimeoutError:
-            print("Aviso: A página demorou a ficar ociosa. Continuando...")
-        except PlaywrightError as e:
-            print(f"Erro ao carregar a página inicial: {e}")
-            await browser.close()
-            return
+    ofertas = await extrair_ofertas()
 
-        # Salva o HTML da página de busca para depuração
-        print(f"Salvando HTML da página de busca em '{DEBUG_HTML}'...")
-        async with aiofiles.open(DEBUG_HTML, "w", encoding="utf-8") as f:
-            await f.write(await page.content())
-        print("HTML salvo.")
+    if ofertas is None:
+        auditor.fatal("main", "Extração falhou criticamente. Abortando.")
+        return
 
-        # Coleta os links
-        urls = await coletar_links(page)
+    if not ofertas:
+        auditor.warning("main", "Nenhuma oferta extraída. Encerrando.")
+        return
 
-        if not urls:
-            print("\nNenhuma oferta encontrada. O arquivo 'debug_page.html' foi gerado.")
-            print("Abra-o no VS Code e procure por um link de oferta para ajustar os seletores.")
-            await browser.close()
-            return
+    auditor.info("main", f"Extração: {len(ofertas)} oferta(s).")
 
-        print(f"\nTotal de {len(urls)} ofertas encontradas. Iniciando extração...")
-        translator = GoogleTranslator(source="auto", target="pt")
+    lista_final = await _traduzir_com_buffer(ofertas)
 
-        print(f"Criando arquivo de saída: {OUTPUT_FILE}")
-        async with aiofiles.open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            for i, url in enumerate(urls, start=1):
-                print(f"\n[{i}/{len(urls)}] Processando: {url}")
-                try:
-                    await page.goto(url, timeout=60000)
-                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
-                    print("  -> Página da oferta carregada. Extraindo texto...")
+    if len(lista_final) != len(ofertas):
+        auditor.error(
+            "main",
+            f"Discrepância: extraídas={len(ofertas)}, consolidadas={len(lista_final)}.",
+        )
 
-                    texto_original = await page.inner_text("body")
-                    linhas = [linha.strip() for linha in texto_original.split("\n") if linha.strip()]
-                    texto_limpo = "\n".join(linhas)
-                    print(f"  -> Texto extraído ({len(texto_limpo)} caracteres). Traduzindo...")
+    if not await salvar_ofertas(lista_final):
+        auditor.fatal("main", "Falha ao salvar arquivo final.")
+        return
 
-                    try:
-                        texto_traduzido = translator.translate(texto_limpo)
-                        print("  -> Tradução concluída.")
-                    except Exception as e_trans:  # noqa: BLE001
-                        print(f"  -> Erro na tradução: {e_trans}. Salvando original.")
-                        texto_traduzido = "[ERRO NA TRADUÇÃO - TEXTO ORIGINAL]\n" + texto_limpo
-
-                    separador = "=" * 80 + "\n"
-                    await f.write(separador)
-                    await f.write(f"URL: {url}\n")
-                    await f.write(separador)
-                    await f.write(texto_traduzido)
-                    await f.write("\n\n\n")
-                    print("  -> Dados gravados no arquivo.")
-
-                    await asyncio.sleep(2)
-
-                except PlaywrightTimeoutError:
-                    print(f"  -> Timeout ao processar {url}")
-                    await f.write(f"ERRO: Timeout ao acessar {url}\n\n")
-                except PlaywrightError as e:
-                    print(f"  -> Erro do Playwright em {url}: {e}")
-                    await f.write(f"ERRO: {e} em {url}\n\n")
-
-        print(f"\nProcessamento concluído! Dados salvos em '{OUTPUT_FILE}'")
-        await browser.close()
+    traduzidas = sum(1 for o in lista_final if o.get("traduzido", False))
+    auditor.info("main", "=" * 60)
+    auditor.info(
+        "main",
+        f"CONCLUÍDO | total={len(lista_final)} | "
+        f"traduzidas={traduzidas} | falhas={len(lista_final) - traduzidas}",
+    )
+    auditor.info("main", "=" * 60)
 
 
 if __name__ == "__main__":
