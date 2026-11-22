@@ -1,58 +1,38 @@
-from googletrans import Translator
-import auditor
+"""Tradução de ofertas do ADEM (português).
 
-# O tradutor agora é gerenciado dentro de um contexto assíncrono.
-# Não instanciamos globalmente para evitar problemas de sessão.
-_primeira_traducao_global = True
+Delegado a ``proj_biblioteca.traducao.traduzir``, com o provedor ``Translator``
+do ``googletrans`` injetado via fábrica. Mantém o contrato assíncrono:
+``traduzir(texto) -> (sucesso, texto_resultado, retentavel)``.
 
-LIMITE_CARACTERES = 4000
+Política preservada (fail-first / graceful fall):
+- texto vazio -> (True, "", False)
+- acima de LIMITE_CARACTERES -> (False, original, False)  [não retentável]
+- rate limit / falha transitória -> (False, original, True) [retentável]
+"""
 
+from __future__ import annotations
 
-def _detectar_rate_limit(erro: str) -> bool:
-    marcadores = ("429", "too many requests", "quota", "503", "server error")
-    return any(m in erro for m in marcadores)
+from proj_biblioteca import traducao
+
+LIMITE_CARACTERES = traducao.LIMITE_CARACTERES
 
 
 async def traduzir(texto: str) -> tuple[bool, str, bool]:
+    """Traduz `texto` para o português.
+
+    Injetamos o ``Translator`` do ``googletrans`` como fábrica para evitar
+    instanciar globalmente (problemas de sessão) e para não importar
+    ``googletrans`` a menos que o módulo seja usado.
     """
-    Retorna (sucesso, texto_resultado, retentavel).
-    """
-    global _primeira_traducao_global
+    return await traducao.traduzir(
+        texto,
+        fabrica=lambda: _translator(),
+        destino="pt",
+        limite=LIMITE_CARACTERES,
+    )
 
-    # Early Return: texto vazio
-    if not texto or not texto.strip():
-        return True, "", False
 
-    # Fail First: estouro de caracteres
-    if len(texto) > LIMITE_CARACTERES:
-        auditor.estouro_caracteres(
-            "tradutor",
-            f"Texto com {len(texto)} caracteres excede o limite de {LIMITE_CARACTERES}. "
-            f"Tradução abortada por política de MVP.",
-        )
-        return False, texto, False
+def _translator():
+    from googletrans import Translator
 
-    try:
-        # A correção principal: usar 'async with' e 'await'
-        async with Translator() as translator:
-            resultado = await translator.translate(texto, dest="pt")
-            _primeira_traducao_global = False
-
-            if resultado and resultado.text:
-                return True, resultado.text, False
-            else:
-                auditor.warning("tradutor", "Tradução retornou vazia. Mantendo original.")
-                return False, texto, True
-
-    except Exception as e:
-        msg_erro = str(e).lower()
-
-        if _detectar_rate_limit(msg_erro):
-            if _primeira_traducao_global:
-                auditor.critical("tradutor", f"Bloqueio na 1ª tradução da sessão: {e}")
-            else:
-                auditor.error("tradutor", f"Rate limit detectado: {e}")
-            return False, texto, True
-
-        auditor.error("tradutor", f"Falha na tradução: {e}")
-        return False, texto, True
+    return Translator()
