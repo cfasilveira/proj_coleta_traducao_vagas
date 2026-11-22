@@ -1,9 +1,17 @@
+"""Extrator de ofertas do ADEM (Luxemburgo).
+
+Delegado a ``proj_biblioteca.scraping`` (navegador, coleta de links e limpeza
+de texto). Mantém a filosofia do ADEM: fail-first (sem link → lista vazia),
+graceful fall (texto 100% de ruído → devolve o bruto) e fechamento garantido do
+navegador (evita processo zumbi).
+"""
+
+from __future__ import annotations
+
 from urllib.parse import urljoin
-from playwright.async_api import (
-    Error as PlaywrightError,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
+
+from proj_biblioteca import scraping
+
 import auditor
 
 BASE_URL = "https://adem.public.lu/en/jobboard.html#q=data+analyst&mode=any"
@@ -15,7 +23,7 @@ LINK_SELECTORS = [
     "article a",
 ]
 
-# Linhas de ruído comuns em todas as páginas ADEM
+# Linhas de ruído comuns em todas as páginas ADEM (não são ofertas).
 _RUIDO_MARCADORES = (
     "This site uses cookies",
     "Accept",
@@ -56,47 +64,28 @@ _RUIDO_MARCADORES = (
 )
 
 
-def _limpar_texto(linhas: list[str]) -> list[str]:
-    """Remove linhas de menu, cookies e rodapé. Mantém o conteúdo da oferta."""
-    limpas = []
-    for linha in linhas:
-        if any(ruido in linha for ruido in _RUIDO_MARCADORES):
-            continue
-        limpas.append(linha)
-    return limpas
-
-
 async def _coletar_links(page) -> list[str]:
     for seletor in LINK_SELECTORS:
         try:
             await page.wait_for_selector(seletor, timeout=5000)
             elementos = await page.query_selector_all(seletor)
-            if elementos:
-                urls = []
-                for el in elementos:
-                    href = await el.get_attribute("href")
-                    if href:
-                        urls.append(urljoin("https://adem.public.lu", href))
-                unicas = list(dict.fromkeys(urls))
-                auditor.info("extrator", f"Seletor '{seletor}' coletou {len(unicas)} URLs.")
-                return unicas
-        except PlaywrightTimeoutError:
+        except scraping.ScrapingIndisponivel:
+            raise
+        except Exception:  # timeout do Playwright: tenta o próximo seletor
             continue
+        hrefs = [await el.get_attribute("href") for el in elementos]
+        unicos = scraping.links_unicos(hrefs, urljoin(BASE_URL, "/"))
+        if unicos:
+            auditor.info("extrator", f"Seletor '{seletor}' coletou {len(unicos)} URLs.")
+            return unicos
     return []
 
 
 async def extrair_ofertas() -> list[dict] | None:
     ofertas: list[dict] = []
-    browser = None
 
     try:
-        async with async_playwright() as p:
-            try:
-                browser = await p.chromium.launch(headless=False)
-            except PlaywrightError as e:
-                auditor.fatal("extrator", f"Falha ao abrir navegador: {e}")
-                return None
-
+        async with scraping.navegador(headless=False) as browser:
             page = await browser.new_page()
             page.set_default_timeout(45000)
 
@@ -105,16 +94,12 @@ async def extrair_ofertas() -> list[dict] | None:
                 response = await page.goto(BASE_URL, timeout=60000)
                 if response and response.status >= 400:
                     auditor.fatal(
-                        "extrator",
-                        f"Página inicial retornou HTTP {response.status}.",
+                        "extrator", f"Página inicial retornou HTTP {response.status}."
                     )
                     return None
                 await page.wait_for_load_state("networkidle", timeout=30000)
-            except PlaywrightTimeoutError:
-                auditor.warning("extrator", "Rede não ficou ociosa a tempo. Continuando.")
-            except PlaywrightError as e:
-                auditor.fatal("extrator", f"Falha ao carregar página inicial: {e}")
-                return None
+            except Exception as e:  # noqa: BLE001 - falha de carregamento da inicial
+                auditor.warning("extrator", f"Rede não ficou ociosa a tempo: {e}. Continuando.")
 
             urls = await _coletar_links(page)
 
@@ -136,40 +121,21 @@ async def extrair_ofertas() -> list[dict] | None:
                     await page.goto(url, timeout=60000)
                     await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-                    # Título real via page.title() (sem ruído)
                     titulo = (await page.title()).strip() or "Sem título"
 
                     bruto = await page.inner_text("body")
-                    linhas = [l.strip() for l in bruto.split("\n") if l.strip()]
-                    linhas_limpas = _limpar_texto(linhas)
+                    texto_final = scraping.extrair_texto(bruto, _RUIDO_MARCADORES)
 
-                    # Sanity check: se ficou vazio, usa o bruto (Fall Gracefully)
-                    texto_final = (
-                        "\n".join(linhas_limpas)
-                        if linhas_limpas
-                        else "\n".join(linhas)
-                    )
+                    ofertas.append({"url": url, "titulo": titulo, "texto": texto_final})
 
-                    ofertas.append({
-                        "url": url,
-                        "titulo": titulo,
-                        "texto": texto_final,
-                    })
+                except Exception as e:  # noqa: BLE001 - falha em uma oferta: pula (graceful fall)
+                    auditor.error("extrator", f"Erro ao extrair {url}: {e}. Pulando.")
 
-                except PlaywrightTimeoutError:
-                    auditor.error("extrator", f"Timeout em {url}. Pulando.")
-                except PlaywrightError as e:
-                    auditor.error("extrator", f"Erro Playwright em {url}: {e}. Pulando.")
-
+    except scraping.ScrapingIndisponivel as e:
+        auditor.fatal("extrator", f"Navegador indisponível: {e}")
+        return None
     except Exception as e:  # noqa: BLE001 - catch-all final do pipeline
         auditor.fatal("extrator", f"Erro catastrófico: {e}")
         return None
-    finally:
-        # Garante fechamento mesmo em erro (evita processo zumbi)
-        if browser is not None:
-            try:
-                await browser.close()
-            except PlaywrightError as e:
-                auditor.warning("extrator", f"Falha ao fechar navegador: {e}")
 
     return ofertas
