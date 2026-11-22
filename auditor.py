@@ -1,29 +1,25 @@
-import logging
-import sys
+"""Auditor de execução do ADEM.
 
-LOG_FILE = "execucao.log"
+Delegado a ``proj_biblioteca.log.configurar_log`` (logger de execução com
+arquivo + console, idempotente). Mantém a API histórica:
+``info/warning/error/critical/fatal/estouro_caracteres(modulo, mensagem)``,
+com prefixo ``[MODULO]`` e gravação em ``execucao.log``.
 
-_logger = logging.getLogger("auditor")
-_logger.setLevel(logging.DEBUG)
+Nunca levanta: falhas de log são absorvidas (graceful fall) para não derrubar
+o pipeline.
+"""
 
-if not _logger.handlers:
-    # Fail First: falha de log não derruba o pipeline
-    try:
-        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s | %(levelname)-8s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-        _logger.addHandler(file_handler)
-    except OSError as e:
-        print(f"[AUDITOR] Aviso: não foi possível abrir {LOG_FILE}: {e}", file=sys.stderr)
+from __future__ import annotations
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%H:%M:%S",
-    ))
-    _logger.addHandler(console_handler)
+from proj_biblioteca.log import configurar_log
+
+_LOGGER = configurar_log(
+    "auditor",
+    arquivo="execucao.log",
+    console=True,
+    nivel="DEBUG",
+    formato="texto",
+)
 
 
 def _fmt(modulo: str, mensagem: str) -> str:
@@ -31,28 +27,28 @@ def _fmt(modulo: str, mensagem: str) -> str:
 
 
 def info(modulo: str, mensagem: str) -> None:
-    _logger.info(_fmt(modulo, mensagem))
+    _LOGGER.info(_fmt(modulo, mensagem))
 
 
 def warning(modulo: str, mensagem: str) -> None:
-    _logger.warning(_fmt(modulo, mensagem))
+    _LOGGER.warning(_fmt(modulo, mensagem))
 
 
 def error(modulo: str, mensagem: str) -> None:
-    _logger.error(_fmt(modulo, mensagem))
+    _LOGGER.error(_fmt(modulo, mensagem))
 
 
 def critical(modulo: str, mensagem: str) -> None:
-    _logger.critical(_fmt(modulo, mensagem))
+    _LOGGER.critical(_fmt(modulo, mensagem))
 
 
 def fatal(modulo: str, mensagem: str) -> None:
-    _logger.critical(_fmt(modulo, f"FATAL: {mensagem}"))
+    _LOGGER.critical(_fmt(modulo, f"FATAL: {mensagem}"))
 
 
 def estouro_caracteres(modulo: str, mensagem: str) -> None:
+    """Categoria dedicada: texto excedeu o limite operacional do MVP.
+
+    Falha esperada e caracterizada — não é erro de rede nem bloqueio.
     """
-    Categoria dedicada: texto excedeu o limite operacional do MVP.
-    É uma falha esperada e caracterizada — não é erro de rede nem bloqueio.
-    """
-    _logger.warning(_fmt(modulo, f"[ESTOURO_CARACTERES] {mensagem}"))
+    _LOGGER.warning(_fmt(modulo, f"[ESTOURO_CARACTERES] {mensagem}"))
