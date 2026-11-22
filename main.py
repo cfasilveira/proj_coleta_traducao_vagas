@@ -1,4 +1,15 @@
+"""Entry point do pipeline ADEM (Luxemburgo).
+
+Orquestra extração, tradução (com retry) e gravação de ofertas. Nunca termina
+com traceback bruto.
+"""
+
+from __future__ import annotations
+
 import asyncio
+
+from proj_biblioteca import retry
+
 from extrator_adem import extrair_ofertas
 from tradutor_texto import traduzir
 from gerenciador_arquivo import salvar_ofertas
@@ -9,6 +20,20 @@ ESPERA_ENTRE_RETRIES = (30, 60, 120)
 PAUSA_ENTRE_TRADUCOES = 1
 
 
+async def _traduzir_una(oferta: dict) -> None:
+    """Traduz uma oferta, atualizando-a in-place.
+
+    Levanta quando a tradução falhou mas é retentável, para que
+    ``retry.repetir_async`` possa retentar. Falhas caracterizadas (não
+    retentáveis) não levantam.
+    """
+    sucesso, texto, retentavel = await traduzir(oferta["texto"])
+    oferta["traduzido"] = sucesso
+    oferta["texto_traduzido"] = texto if sucesso else ""
+    if not sucesso and retentavel:
+        raise RuntimeError(f"Tradução falhou (retentável) para {oferta.get('url', '?')}")
+
+
 async def _traduzir_com_buffer(ofertas: list[dict]) -> list[dict]:
     lista_final: list[dict] = []
     buffer_retry: list[dict] = []
@@ -17,7 +42,6 @@ async def _traduzir_com_buffer(ofertas: list[dict]) -> list[dict]:
     auditor.info("main", f"Tradução primária de {len(ofertas)} ofertas...")
     for i, oferta in enumerate(ofertas, start=1):
         auditor.info("main", f"  Traduzindo [{i}/{len(ofertas)}]")
-        # CORREÇÃO: traduzir() agora é async, precisa de await
         sucesso, texto, retentavel = await traduzir(oferta["texto"])
         oferta["traduzido"] = sucesso
         oferta["texto_traduzido"] = texto if sucesso else ""
@@ -51,18 +75,19 @@ async def _traduzir_com_buffer(ofertas: list[dict]) -> list[dict]:
 
         novos_falhos: list[dict] = []
         for oferta in buffer_retry:
-            # CORREÇÃO: traduzir() agora é async, precisa de await
-            sucesso, texto, retentavel = await traduzir(oferta["texto"])
-            if sucesso:
-                oferta["traduzido"] = True
-                oferta["texto_traduzido"] = texto
+            try:
+                # repetir_async tenta até MAX_TENTATIVAS_RETRY com esperas entre elas.
+                await retry.repetir_async(
+                    lambda o=oferta: _traduzir_una(o),
+                    tentativas=MAX_TENTATIVAS_RETRY,
+                    esperas=ESPERA_ENTRE_RETRIES,
+                )
                 lista_final.append(oferta)
-            elif retentavel:
+            except Exception as erro:  # noqa: BLE001 - ainda falhou após todas as tentativas
+                auditor.error("main", f"Oferta ainda falhou após retry: {erro}")
+                oferta["traduzido"] = False
+                oferta["texto_traduzido"] = ""
                 novos_falhos.append(oferta)
-            else:
-                # Falha caracterizada durante retry → descarta do buffer
-                lista_final.append(oferta)
-                descartadas_por_tamanho += 1
         buffer_retry = novos_falhos
 
     for oferta in buffer_retry:
