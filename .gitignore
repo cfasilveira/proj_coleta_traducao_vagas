@@ -11,3 +11,7 @@ wheels/
 ofertas_Luxemburgo.txt
 debug_page.html
 execucao.log
+# Screenshots de debug (nao versionar)
+prints/
+adem_p*.png
+adem_p*.jpg
