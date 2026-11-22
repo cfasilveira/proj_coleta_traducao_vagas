@@ -1,6 +1,19 @@
+"""Gerenciador de arquivo de saída do ADEM.
+
+Renderiza o relatório de ofertas (específico do ADEM) e grava de forma atômica
+via ``proj_biblioteca.persistencia.escrever_atomico`` (tempfile + fsync +
+os.replace — nunca deixa arquivo pela metade), executado em thread para não
+bloquear o loop asyncio.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import os
-import aiofiles
 from datetime import datetime
+
+from proj_biblioteca import persistencia
+
 import auditor
 
 ARQUIVO_SAIDA = "ofertas_Luxemburgo.txt"
@@ -47,28 +60,26 @@ async def salvar_ofertas(ofertas: list[dict]) -> bool:
 
     auditor.info("arquivo", f"Gravando {len(ofertas)} ofertas em '{ARQUIVO_SAIDA}'...")
 
-    # Performance: monta o conteúdo inteiro em memória e escreve uma vez
+    # Performance: monta o conteúdo inteiro em memória e escreve uma vez.
     conteudo = _renderizar_cabecalho(ofertas) + "".join(
         _renderizar_oferta(i, len(ofertas), o) for i, o in enumerate(ofertas, start=1)
     )
 
-    # Escrita atômica: grava em .tmp e renomeia
-    tmp_path = ARQUIVO_SAIDA + ".tmp"
+    # Escrita atômica (tempfile + fsync + os.replace) via thread, sem bloquear o loop.
     try:
-        async with aiofiles.open(tmp_path, "w", encoding="utf-8", errors="replace") as f:
-            await f.write(conteudo)
-        os.replace(tmp_path, ARQUIVO_SAIDA)
-        auditor.info("arquivo", f"Arquivo salvo: '{ARQUIVO_SAIDA}' ({len(conteudo)} bytes).")
+        await asyncio.to_thread(persistencia.escrever_atomico, ARQUIVO_SAIDA, conteudo)
+        auditor.info(
+            "arquivo", f"Arquivo salvo: '{ARQUIVO_SAIDA}' ({len(conteudo)} bytes)."
+        )
         return True
-
     except PermissionError as e:
         auditor.fatal("arquivo", f"Sem permissão de escrita: {e}")
         return False
     except OSError as e:
         auditor.error("arquivo", f"Falha de I/O: {e}")
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(ARQUIVO_SAIDA + ".tmp"):
+                os.remove(ARQUIVO_SAIDA + ".tmp")
         except OSError:
             pass
         return False
